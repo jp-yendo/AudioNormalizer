@@ -6,9 +6,9 @@ import json
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QFileDialog, QPushButton,
                             QLineEdit, QLabel, QVBoxLayout, QHBoxLayout, QWidget,
                             QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
-                            QProgressDialog, QComboBox)
+                            QProgressDialog, QComboBox, QDesktopWidget)
 from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QFontDatabase
+from PyQt5.QtGui import QFont, QFontDatabase, QIcon
 
 # Windowsの場合、STARTUPINFOをインポート
 if os.name == 'nt':
@@ -219,7 +219,9 @@ class NormalizeWorker(QThread):
                     "-ar", self.sample_rate,  # 指定されたサンプリング周波数を使用
                     "-c:a", encoder,
                     "-map_metadata", "0",
-                    "-map", "0:a:0",
+                    "-map", "0:a:0",  # オーディオストリームのマッピング
+                    "-map", "0:v?",   # ビデオストリーム（アートワーク）があれば保持
+                    "-c:v", "copy",   # ビデオ（アートワーク）はそのままコピー
                 ]
 
                 # エンコーダー固有のオプションを設定
@@ -290,6 +292,17 @@ class AudioNormalizer(QMainWindow):
         super().__init__()
         self.setWindowTitle("Audio Normalizer")
         self.setGeometry(100, 100, 800, 600)
+
+        # ウィンドウを画面中央に配置
+        frame_geometry = self.frameGeometry()
+        center_point = QDesktopWidget().availableGeometry().center()
+        frame_geometry.moveCenter(center_point)
+        self.move(frame_geometry.topLeft())
+
+        # アプリケーションアイコンを設定
+        icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico")
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         # システムフォントを設定
         self.setFont(init_font())
@@ -730,6 +743,10 @@ class AudioNormalizer(QMainWindow):
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setFont(init_font())
+    # アプリケーション全体のアイコンを設定
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "app.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     normalizer = AudioNormalizer()
     normalizer.show()
     sys.exit(app.exec_())
