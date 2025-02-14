@@ -10,6 +10,10 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QFileDialog, QPushButton
 from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QFontDatabase
 
+# Windowsの場合、STARTUPINFOをインポート
+if os.name == 'nt':
+    from subprocess import STARTUPINFO, STARTF_USESHOWWINDOW
+
 def init_font():
     # システムのデフォルトフォントを使用
     font_db = QFontDatabase()
@@ -37,6 +41,12 @@ class AnalyzeWorker(QThread):
             self.progress.emit(i, os.path.basename(file_path))
 
             try:
+                # Windowsの場合、STARTUPINFOを設定
+                startupinfo = None
+                if os.name == 'nt':
+                    startupinfo = STARTUPINFO()
+                    startupinfo.dwFlags |= STARTF_USESHOWWINDOW
+
                 # まずチャンネル数を取得
                 probe_command = [
                     self.ffmpeg_path,
@@ -47,7 +57,8 @@ class AnalyzeWorker(QThread):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     encoding='utf-8',
-                    errors='replace'
+                    errors='replace',
+                    startupinfo=startupinfo
                 )
                 _, probe_output = probe_process.communicate()
 
@@ -74,7 +85,8 @@ class AnalyzeWorker(QThread):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     encoding='utf-8',
-                    errors='replace'
+                    errors='replace',
+                    startupinfo=startupinfo
                 )
                 output, error = process.communicate()
 
@@ -140,6 +152,12 @@ class NormalizeWorker(QThread):
         success_files = 0
         error_files = []
 
+        # Windowsの場合、STARTUPINFOを設定
+        startupinfo = None
+        if os.name == 'nt':
+            startupinfo = STARTUPINFO()
+            startupinfo.dwFlags |= STARTF_USESHOWWINDOW
+
         for i, file_info in enumerate(self.file_list):
             if self.is_cancelled:
                 break
@@ -153,6 +171,12 @@ class NormalizeWorker(QThread):
             self.progress.emit(i, os.path.basename(file_path))
 
             try:
+                # Windowsの場合、STARTUPINFOを設定
+                startupinfo = None
+                if os.name == 'nt':
+                    startupinfo = STARTUPINFO()
+                    startupinfo.dwFlags |= STARTF_USESHOWWINDOW
+
                 # 入力ファイルの情報を取得
                 probe_command = [
                     self.ffmpeg_path,
@@ -164,7 +188,8 @@ class NormalizeWorker(QThread):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     encoding='utf-8',
-                    errors='replace'
+                    errors='replace',
+                    startupinfo=startupinfo
                 )
                 _, probe_output = probe_process.communicate()
 
@@ -240,7 +265,8 @@ class NormalizeWorker(QThread):
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     encoding='utf-8',
-                    errors='replace'
+                    errors='replace',
+                    startupinfo=startupinfo
                 )
                 _, error = process.communicate()
 
