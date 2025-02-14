@@ -1,19 +1,206 @@
 import os
 import sys
 import re
+import subprocess
+import json
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QFileDialog, QPushButton,
                             QLineEdit, QLabel, QVBoxLayout, QHBoxLayout, QWidget,
                             QMessageBox, QTableWidget, QTableWidgetItem, QHeaderView,
                             QProgressDialog)
-from PyQt5.QtCore import Qt, QSettings
+from PyQt5.QtCore import Qt, QSettings, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QFontDatabase
-import subprocess
 
 def init_font():
     # システムのデフォルトフォントを使用
     font_db = QFontDatabase()
     system_font = QFont(font_db.systemFont(QFontDatabase.GeneralFont))
     return system_font
+
+class AnalyzeWorker(QThread):
+    progress = pyqtSignal(int, str)  # 進捗と現在のファイル名
+    finished = pyqtSignal(list)  # 処理結果
+    error = pyqtSignal(str)  # エラーメッセージ
+
+    def __init__(self, file_list, ffmpeg_path):
+        super().__init__()
+        self.file_list = file_list  # 元のリストを参照として保持
+        self.ffmpeg_path = ffmpeg_path
+        self.is_cancelled = False
+
+    def run(self):
+        results = []
+        for i, file_info in enumerate(self.file_list):
+            if self.is_cancelled:
+                break
+
+            file_path = file_info['path']
+            self.progress.emit(i, os.path.basename(file_path))
+
+            try:
+                command = [
+                    self.ffmpeg_path,
+                    "-i", file_path,
+                    "-af", "loudnorm=I=-16:LRA=11:TP=-1.5:print_format=json",
+                    "-f", "null",
+                    "-"
+                ]
+                process = subprocess.Popen(
+                    command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                output, error = process.communicate()
+
+                json_str = self.extract_json_from_output(error)
+                if json_str:
+                    data = json.loads(json_str)
+                    input_i = data.get('input_i')
+                    if input_i is not None:
+                        # 直接file_infoを更新
+                        file_info['lufs'] = float(input_i)
+                        results.append(file_info)
+                        self.progress.emit(i + 1, "")
+                        continue
+
+                # JSONの解析に失敗した場合のみNoneを設定
+                file_info['lufs'] = None
+                results.append(file_info)
+                self.progress.emit(i + 1, "")
+
+            except Exception as e:
+                file_info['lufs'] = None
+                results.append(file_info)
+                self.error.emit(f"解析エラー: {file_path}\n{str(e)}")
+                self.progress.emit(i + 1, "")
+
+        if not self.is_cancelled:
+            self.finished.emit(results)
+
+    def extract_json_from_output(self, output):
+        start = output.find('{')
+        if start == -1:
+            return None
+
+        count = 1
+        for i in range(start + 1, len(output)):
+            if output[i] == '{':
+                count += 1
+            elif output[i] == '}':
+                count -= 1
+                if count == 0:
+                    return output[start:i+1]
+        return None
+
+
+class NormalizeWorker(QThread):
+    progress = pyqtSignal(int, str)  # 進捗と現在のファイル名
+    finished = pyqtSignal(int, list)  # 成功数とエラーリスト
+    error = pyqtSignal(str)  # エラーメッセージ
+
+    def __init__(self, file_list, ffmpeg_path, output_dir, target_lufs):
+        super().__init__()
+        self.file_list = file_list
+        self.ffmpeg_path = ffmpeg_path
+        self.output_dir = output_dir
+        self.target_lufs = target_lufs
+        self.is_cancelled = False
+
+    def run(self):
+        success_files = 0
+        error_files = []
+
+        for i, file_info in enumerate(self.file_list):
+            if self.is_cancelled:
+                break
+
+            file_path = file_info['path']
+            output_path = os.path.join(
+                self.output_dir,
+                f"{os.path.basename(file_path)}"
+            )
+
+            self.progress.emit(i, os.path.basename(file_path))
+
+            try:
+                # 入力ファイルの情報を取得
+                probe_command = [
+                    self.ffmpeg_path,
+                    "-i", file_path
+                ]
+
+                probe_process = subprocess.Popen(
+                    probe_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                _, probe_output = probe_process.communicate()
+
+                # 各種パラメータを抽出
+                bitrate_match = re.search(r'bitrate:\s*(\d+)\s*kb/s', probe_output)
+                sample_rate_match = re.search(r'(\d+)\s*Hz', probe_output)
+                codec_match = re.search(r'Audio:\s*(\w+)', probe_output)
+
+                bitrate = f"{bitrate_match.group(1)}k" if bitrate_match else "160k"
+                sample_rate = sample_rate_match.group(1) if sample_rate_match else "44100"
+                codec = codec_match.group(1) if codec_match else "mp3"
+
+                # コーデックに応じたエンコーダーを選択
+                codec_map = {
+                    'mp3': 'libmp3lame',
+                    'aac': 'aac',
+                    'vorbis': 'libvorbis',
+                    'opus': 'libopus',
+                    'flac': 'flac'
+                }
+                encoder = codec_map.get(codec, 'copy')
+
+                # 正規化コマンドを実行
+                normalize_command = [
+                    self.ffmpeg_path,
+                    "-y",
+                    "-i", file_path,
+                    "-af", f"loudnorm=I={self.target_lufs}:LRA=11:TP=-1.5:linear=true",
+                    "-ar", sample_rate,
+                    "-c:a", encoder,
+                    "-b:a", bitrate,
+                    "-map_metadata", "0",
+                    "-map", "0:a:0",
+                ]
+
+                if encoder == 'libmp3lame':
+                    normalize_command.extend(["-q:a", "0"])
+                elif encoder == 'aac':
+                    normalize_command.extend(["-strict", "experimental"])
+
+                normalize_command.append(output_path)
+
+                process = subprocess.Popen(
+                    normalize_command,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    encoding='utf-8',
+                    errors='replace'
+                )
+                _, error = process.communicate()
+
+                if process.returncode == 0:
+                    success_files += 1
+                    self.progress.emit(i + 1, "")
+                else:
+                    error_files.append((file_path, error))
+                    self.error.emit(f"正規化エラー: {file_path}\n{error}")
+                    self.progress.emit(i + 1, "")
+
+            except Exception as e:
+                error_files.append((file_path, str(e)))
+                self.error.emit(f"正規化エラー: {file_path}\n{str(e)}")
+                self.progress.emit(i + 1, "")
+
+        self.finished.emit(success_files, error_files)
 
 class AudioNormalizer(QMainWindow):
     def __init__(self):
@@ -49,11 +236,13 @@ class AudioNormalizer(QMainWindow):
         # ファイル一覧テーブル
         self.file_table = QTableWidget()
         self.file_table.setColumnCount(3)
-        self.file_table.setHorizontalHeaderLabels(["ファイル名", "パス", "LUFS"])
+        self.file_table.setHorizontalHeaderLabels(["ファイル名", "ディレクトリ", "LUFS"])
         header = self.file_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        # テーブルを編集不可に設定
+        self.file_table.setEditTriggers(QTableWidget.NoEditTriggers)
         layout.addWidget(self.file_table)
 
         # 解析ボタン
@@ -133,8 +322,8 @@ class AudioNormalizer(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "ffmpegの実行ファイルを選択",
-            "",
-            "Executable Files (*.exe)",
+            "ffmpeg.exe",
+            "Executable Files (ffmpeg.exe);;All Files (*)",
             options=options
         )
         if file_path:
@@ -176,16 +365,37 @@ class AudioNormalizer(QMainWindow):
             self.update_file_table()
 
     def update_file_table(self):
-        self.file_table.setRowCount(len(self.file_list))
-        for row, file_info in enumerate(self.file_list):
-            file_path = file_info['path']
-            # ファイル名
-            self.file_table.setItem(row, 0, QTableWidgetItem(os.path.basename(file_path)))
-            # パス
-            self.file_table.setItem(row, 1, QTableWidgetItem(file_path))
-            # LUFS
-            lufs_value = str(file_info['lufs']) if file_info['lufs'] is not None else ""
-            self.file_table.setItem(row, 2, QTableWidgetItem(lufs_value))
+        try:
+            self.file_table.setRowCount(len(self.file_list))
+            for row, file_info in enumerate(self.file_list):
+                file_path = file_info['path']
+                # ファイル名
+                name_item = QTableWidgetItem(os.path.basename(file_path))
+                name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+                self.file_table.setItem(row, 0, name_item)
+
+                # ディレクトリパス
+                dir_item = QTableWidgetItem(os.path.dirname(file_path))
+                dir_item.setFlags(dir_item.flags() & ~Qt.ItemIsEditable)
+                self.file_table.setItem(row, 1, dir_item)
+
+                # LUFS
+                lufs = file_info.get('lufs')
+                if lufs is not None:
+                    lufs_text = f"{lufs:.1f}"
+                    lufs_item = QTableWidgetItem(lufs_text)
+                    lufs_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    lufs_item = QTableWidgetItem("")
+                lufs_item.setFlags(lufs_item.flags() & ~Qt.ItemIsEditable)
+                self.file_table.setItem(row, 2, lufs_item)
+
+            # テーブルの更新を強制
+            self.file_table.viewport().update()
+            self.file_table.repaint()
+
+        except Exception as e:
+            print(f"テーブル更新エラー: {str(e)}")
 
     def analyze_files(self):
         if not self.file_list:
@@ -196,73 +406,66 @@ class AudioNormalizer(QMainWindow):
             QMessageBox.warning(self, "警告", "ffmpegの実行ファイルパスが指定されていません")
             return
 
-        # プログレスダイアログを作成
-        progress = QProgressDialog("オーディオファイルを解析中...", "キャンセル", 0, len(self.file_list), self)
-        progress.setWindowTitle("解析中")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
+        # メインウィンドウを無効化
+        self.setEnabled(False)
 
-        for i, file_info in enumerate(self.file_list):
-            if progress.wasCanceled():
-                break
+        try:
+            # プログレスダイアログを作成
+            self.progress_dialog = QProgressDialog("オーディオファイルを解析中...", "キャンセル", 0, len(self.file_list), self)
+            self.progress_dialog.setWindowTitle("解析中")
+            self.progress_dialog.setWindowModality(Qt.ApplicationModal)
+            self.progress_dialog.setMinimumDuration(0)
 
-            file_path = file_info['path']
-            progress.setLabelText(f"解析中: {os.path.basename(file_path)}")
+            # ワーカーを作成
+            self.analyze_worker = AnalyzeWorker(self.file_list, self.ffmpeg_path)
 
-            command = [
-                self.ffmpeg_path,
-                "-i", file_path,
-                "-af", "loudnorm=I=-16:LRA=11:TP=-1.5:print_format=json",
-                "-f", "null",
-                "-"
-            ]
-            try:
-                process = subprocess.Popen(
-                    command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                output, error = process.communicate()
+            # シグナル接続
+            self.progress_dialog.canceled.connect(self.cancel_analyze)
+            self.analyze_worker.progress.connect(self.update_analyze_progress)
+            self.analyze_worker.error.connect(lambda msg: QMessageBox.warning(self, "解析エラー", msg))
+            self.analyze_worker.finished.connect(self.handle_analyze_finished)
 
-                json_str = self.extract_json_from_output(error)
-                if json_str:
-                    import json
-                    data = json.loads(json_str)
-                    input_i = data.get('input_i')
-                    if input_i is not None:
-                        self.file_list[i]['lufs'] = float(input_i)
-                        print(f"解析結果: {file_path} - LUFS: {input_i}")
-                else:
-                    print(f"LUFS値が見つかりません: {file_path}")
-                    self.file_list[i]['lufs'] = None
+            # ワーカー開始
+            self.analyze_worker.start()
 
-            except Exception as e:
-                print(f"解析エラー: {file_path}")
-                print(e)
-                self.file_list[i]['lufs'] = None
+        except Exception as e:
+            self.setEnabled(True)
+            QMessageBox.critical(self, "エラー", f"解析処理の初期化中にエラーが発生しました:\n{str(e)}")
 
-            progress.setValue(i + 1)
+    def update_analyze_progress(self, value, filename):
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.setValue(value)
+            if filename:
+                self.progress_dialog.setLabelText(f"解析中: {filename}")
 
-        self.update_file_table()
+    def cleanup_progress_dialog(self):
+        """プログレスダイアログを安全に削除"""
+        try:
+            if hasattr(self, 'progress_dialog'):
+                self.progress_dialog.close()
+                delattr(self, 'progress_dialog')
+        except:
+            pass
 
-    def extract_json_from_output(self, output):
-        """FFmpeg出力からJSON文字列を抽出する"""
-        start = output.find('{')
-        if start == -1:
-            return None
+    def handle_analyze_finished(self, results):
+        try:
+            # プログレスダイアログを閉じる
+            self.cleanup_progress_dialog()
 
-        # JSONの終わりを探す
-        count = 1
-        for i in range(start + 1, len(output)):
-            if output[i] == '{':
-                count += 1
-            elif output[i] == '}':
-                count -= 1
-                if count == 0:
-                    return output[start:i+1]
-        return None
+            # 結果をメインのファイルリストに反映
+            path_to_lufs = {result['path']: result['lufs'] for result in results}
+            for file_info in self.file_list:
+                if file_info['path'] in path_to_lufs:
+                    file_info['lufs'] = path_to_lufs[file_info['path']]
+
+            # テーブルを更新
+            self.update_file_table()
+
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"解析結果の処理中にエラーが発生しました:\n{str(e)}")
+
+        finally:
+            self.setEnabled(True)
 
     def normalize_files(self):
         if not self.file_list:
@@ -282,115 +485,33 @@ class AudioNormalizer(QMainWindow):
             QMessageBox.warning(self, "警告", "ターゲットLUFS値が指定されていません")
             return
 
+        # メインウィンドウを無効化
+        self.setEnabled(False)
+
         # プログレスダイアログを作成
-        progress = QProgressDialog("オーディオファイルを正規化中...", "キャンセル", 0, len(self.file_list), self)
-        progress.setWindowTitle("処理中")
-        progress.setWindowModality(Qt.WindowModal)
-        progress.setMinimumDuration(0)
+        self.progress_dialog = QProgressDialog("オーディオファイルを正規化中...", "キャンセル", 0, len(self.file_list), self)
+        self.progress_dialog.setWindowTitle("処理中")
+        self.progress_dialog.setWindowModality(Qt.ApplicationModal)
+        self.progress_dialog.setMinimumDuration(0)
 
-        processed_files = 0
-        success_files = 0
-        error_files = []
+        # ワーカーを作成
+        self.normalize_worker = NormalizeWorker(self.file_list, self.ffmpeg_path, self.output_dir, target_lufs)
+        self.progress_dialog.canceled.connect(self.cancel_normalize)
+        self.normalize_worker.progress.connect(self.update_normalize_progress)
+        self.normalize_worker.finished.connect(self.handle_normalize_finished)
+        self.normalize_worker.error.connect(lambda msg: QMessageBox.warning(self, "正規化エラー", msg))
+        self.normalize_worker.start()
 
-        for file_info in self.file_list:
-            if progress.wasCanceled():
-                break
+    def update_normalize_progress(self, value, filename):
+        if hasattr(self, 'progress_dialog'):
+            self.progress_dialog.setValue(value)
+            if filename:
+                self.progress_dialog.setLabelText(f"処理中: {filename}")
 
-            file_path = file_info['path']
-            output_path = os.path.join(
-                self.output_dir,
-                f"{os.path.basename(file_path)}"
-            )
+    def handle_normalize_finished(self, success_files, error_files):
+        # プログレスダイアログを閉じる
+        self.cleanup_progress_dialog()
 
-            progress.setLabelText(f"処理中: {os.path.basename(file_path)}")
-
-            try:
-                # まず入力ファイルの情報を取得
-                probe_command = [
-                    self.ffmpeg_path,
-                    "-i", file_path
-                ]
-
-                probe_process = subprocess.Popen(
-                    probe_command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                _, probe_output = probe_process.communicate()
-
-                # ビットレートを抽出
-                bitrate_match = re.search(r'bitrate:\s*(\d+)\s*kb/s', probe_output)
-                # サンプルレートを抽出
-                sample_rate_match = re.search(r'(\d+)\s*Hz', probe_output)
-                # コーデックを抽出
-                codec_match = re.search(r'Audio:\s*(\w+)', probe_output)
-
-                bitrate = f"{bitrate_match.group(1)}k" if bitrate_match else "160k"
-                sample_rate = sample_rate_match.group(1) if sample_rate_match else "44100"
-                codec = codec_match.group(1) if codec_match else "mp3"
-
-                # コーデックに応じたエンコーダーを選択
-                codec_map = {
-                    'mp3': 'libmp3lame',
-                    'aac': 'aac',
-                    'vorbis': 'libvorbis',
-                    'opus': 'libopus',
-                    'flac': 'flac'
-                }
-                encoder = codec_map.get(codec, 'copy')
-
-                # 正規化コマンドを実行
-                normalize_command = [
-                    self.ffmpeg_path,
-                    "-y",
-                    "-i", file_path,
-                    "-af", f"loudnorm=I={target_lufs}:LRA=11:TP=-1.5:linear=true",
-                    "-ar", sample_rate,
-                    "-c:a", encoder,
-                    "-b:a", bitrate,
-                    "-map_metadata", "0",  # メタデータを保持
-                    "-map", "0:a:0",  # 最初のオーディオストリームのみを使用
-                ]
-
-                # フォーマット固有のオプションを追加
-                if encoder == 'libmp3lame':
-                    normalize_command.extend(["-q:a", "0"])  # 最高品質
-                elif encoder == 'aac':
-                    normalize_command.extend(["-strict", "experimental"])
-
-                # 出力ファイルパスを追加
-                normalize_command.append(output_path)
-
-                # 処理実行
-                process = subprocess.Popen(
-                    normalize_command,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    encoding='utf-8',
-                    errors='replace'
-                )
-                _, error = process.communicate()
-
-                if process.returncode == 0:
-                    success_files += 1
-                    print(f"正規化完了 ({success_files}/{len(self.file_list)}): {output_path}")
-                    print(f"設定値 - ビットレート: {bitrate}, サンプルレート: {sample_rate}, コーデック: {encoder}")
-                else:
-                    error_files.append((file_path, error))
-                    print(f"正規化エラー: {file_path}")
-                    print(f"FFmpegエラー: {error}")
-
-            except Exception as e:
-                error_files.append((file_path, str(e)))
-                print(f"正規化エラー: {file_path}")
-                print(e)
-
-            processed_files += 1
-            progress.setValue(processed_files)
-
-        # 完了メッセージを表示
         if error_files:
             error_msg = "以下のファイルで問題が発生しました:\n\n"
             for file_path, error in error_files:
@@ -406,6 +527,21 @@ class AudioNormalizer(QMainWindow):
                 "完了",
                 f"すべてのファイル({success_files}個)の正規化が完了しました"
             )
+        self.setEnabled(True)
+
+    def cancel_analyze(self):
+        if hasattr(self, 'analyze_worker'):
+            self.analyze_worker.is_cancelled = True
+            self.analyze_worker.wait()
+            self.cleanup_progress_dialog()
+            self.setEnabled(True)
+
+    def cancel_normalize(self):
+        if hasattr(self, 'normalize_worker'):
+            self.normalize_worker.is_cancelled = True
+            self.normalize_worker.wait()
+            self.cleanup_progress_dialog()
+            self.setEnabled(True)
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
